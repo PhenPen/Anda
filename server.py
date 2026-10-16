@@ -3,12 +3,25 @@ import threading
 import json
 import re
 import ssl
+import time
+import queue
 
-import schema
+import db
 import auth
 import messages
 import tls
-from config import SERVER_HOST, PORT, ECHO_DM
+import tokens
+from config import (
+    SERVER_HOST,
+    PORT,
+    ECHO_DM,
+    SERVER_PING_AFTER_SECONDS,
+    SERVER_PING_REPLY_SECONDS,
+    SERVER_MAX_MISSED_PINGS,
+    HEARTBEAT_TICK_SECONDS,
+    OUTBOX_MAX_MESSAGES,
+    CLOSE_FLUSH_SECONDS,
+)
 from logger import logger
 
 clients = []
@@ -23,24 +36,150 @@ class ClientHandler:
         self.address = address
         self.username = None
         self.authenticated = False
+        self.replaced = False            # True if a newer login for this account kicked this connection out
+        self.took_over_session = False   # True if this connection kicked an older one out
+        self.logging_out = False         # True if the client asked to log out (so we flush "Logged out." before closing)
         self.reader = client_socket.makefile('r')
         self.writer = client_socket.makefile('w')
 
+        # Heartbeat: when did we last hear ANYTHING from this client?
+        self.last_heard = time.monotonic()
+
+        # Outgoing queue: everyone who wants to send to this client drops the
+        # message in here, and ONE writer thread is the only thing that ever
+        # writes to the socket. That is what keeps two messages from mixing.
+        self.outbox = queue.Queue(maxsize=OUTBOX_MAX_MESSAGES)
+        self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self.writer_thread.start()
+
+        self._closed = False
+        self._close_lock = threading.Lock()
+        self._closed_event = threading.Event()   # set once closed; also stops the watcher thread
+
+    # ------------------------------------------------------------------
+    # Sending: queue + writer thread
+    # ------------------------------------------------------------------
     def send(self, message):
-        self.writer.write(message + '\n')
-        self.writer.flush()
+        """Queues a line for this client. Never blocks and never raises."""
+        if self._closed:
+            return
+        try:
+            self.outbox.put_nowait(message)
+        except queue.Full:
+            logger.warning(f"{self.username or self.address}: outgoing queue full, dropping connection")
+            self.close(graceful=False)
+
+    def _writer_loop(self):
+        """The only code that writes to this client's socket."""
+        while True:
+            message = self.outbox.get()      # sleeps until something arrives
+            if message is None:              # stop signal
+                break
+            try:
+                self.writer.write(message + '\n')
+                self.writer.flush()
+            except (OSError, ValueError):    # socket died (ValueError = already closed)
+                self.close(graceful=False)
+                break
+
+    def close(self, graceful=True):
+        """
+        Closes this connection. Safe to call from any thread, any number of times.
+        graceful=True: lets the writer send what is already queued (up to
+        CLOSE_FLUSH_SECONDS), then closes. graceful=False: closes right away.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._closed_event.set()
+
+        if graceful:
+            try:
+                self.outbox.put_nowait(None)   # stop signal goes AFTER everything already queued
+                if threading.current_thread() is not self.writer_thread:
+                    self.writer_thread.join(timeout=CLOSE_FLUSH_SECONDS)
+            except queue.Full:
+                pass  # queue is jammed; just close
+
+        # shutdown() is what wakes up a thread stuck waiting to read.
+        try:
+            self.client_socket.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.client_socket.close()
+        except Exception:
+            pass
+
+        # Make sure the writer thread can't be left waiting forever.
+        try:
+            self.outbox.put_nowait(None)
+        except queue.Full:
+            pass
 
     def send_json(self, data):
         self.send(json.dumps(data))
+
+    # ------------------------------------------------------------------
+    # Reading + heartbeat
+    # ------------------------------------------------------------------
+    def _read_line(self):
+        """Reads one line. Returns '' if the connection ended. Any line at all counts as proof of life."""
+        try:
+            line = self.reader.readline()
+        except (OSError, ValueError):   # closed or reset underneath us
+            return ''
+        if line:
+            self.last_heard = time.monotonic()
+        return line
+
+    def _handle_heartbeat(self, data):
+        """Answers pings. Returns True if this message was a heartbeat (so callers skip it)."""
+        msg_type = data.get("type")
+        if msg_type == "ping":
+            self.send_json({"type": "pong"})
+            return True
+        return msg_type == "pong"
+
+    def _watch(self):
+        """
+        Watcher thread, one per connection. Pings after SERVER_PING_AFTER_SECONDS
+        of silence, gives each ping SERVER_PING_REPLY_SECONDS, and closes the
+        connection after SERVER_MAX_MISSED_PINGS misses in a row.
+        """
+        waiting_since = None   # when our outstanding ping was sent, or None
+        misses = 0
+        while not self._closed_event.wait(HEARTBEAT_TICK_SECONDS):
+            now = time.monotonic()
+
+            if waiting_since is not None:
+                if self.last_heard >= waiting_since:      # heard something since the ping
+                    waiting_since = None
+                    misses = 0
+                elif now - waiting_since >= SERVER_PING_REPLY_SECONDS:
+                    misses += 1
+                    if misses >= SERVER_MAX_MISSED_PINGS:
+                        logger.warning(f"{self.username or self.address}: no response to heartbeat, closing connection")
+                        self.close(graceful=False)
+                        return
+                    self.send_json({"type": "ping"})
+                    waiting_since = time.monotonic()
+
+            if waiting_since is None and now - self.last_heard >= SERVER_PING_AFTER_SECONDS:
+                self.send_json({"type": "ping"})
+                waiting_since = time.monotonic()
 
     def authenticate(self):
         """
         Handshake loop before a connection is allowed to join the chat.
         Client sends {"type": "register" | "login", "username": ..., "password": ...}
         until a login succeeds (registration alone does not log the user in).
+        A {"type": "token_login", "token": ...} message can be used instead of a
+        password login.
         """
         while True:
-            line = self.reader.readline()
+            line = self._read_line()
             if not line:
                 return False  # client disconnected before authenticating
 
@@ -54,7 +193,40 @@ class ClientHandler:
                 self.send_json({"type": "error", "message": "Invalid request format."})
                 continue
 
+            if not isinstance(data, dict):
+                continue
+            if self._handle_heartbeat(data):
+                continue
+
             msg_type = data.get("type")
+
+            # Token login has no username/password, so it must be handled
+            # before the username/password check below.
+            if msg_type == "token_login":
+                token = data.get("token")
+                token_user = tokens.validate_token(token) if isinstance(token, str) else None
+
+                if token_user is None:
+                    self.send_json({
+                        "type": "login_result",
+                        "success": False,
+                        "token_rejected": True,
+                        "message": "Session expired. Please log in again."
+                    })
+                    continue
+
+                self.username = token_user
+                self.authenticated = True
+                self.replace_existing_session()
+                self.send_json({
+                    "type": "login_result",
+                    "success": True,
+                    "username": token_user,
+                    "message": f"Welcome back, {token_user}!"
+                })
+                self.send_history()
+                return True
+
             username = (data.get("username") or "").strip()
             password = data.get("password") or ""
 
@@ -67,22 +239,19 @@ class ClientHandler:
                 self.send_json({"type": "register_result", "success": success, "message": message})
 
             elif msg_type == "login":
-                with clients_lock:
-                    already_connected = any(c.username == username for c in clients)
-                if already_connected:
-                    self.send_json({
-                        "type": "login_result",
-                        "success": False,
-                        "message": "That user is already logged in elsewhere."
-                    })
-                    continue
-
                 status, retry_after = auth.verify_login(username, password)
 
                 if status == 'success':
                     self.username = username
                     self.authenticated = True
-                    self.send_json({"type": "login_result", "success": True, "message": f"Welcome, {username}!"})
+                    self.replace_existing_session()
+                    token = tokens.create_token(username)
+                    self.send_json({
+                        "type": "login_result",
+                        "success": True,
+                        "message": f"Welcome, {username}!",
+                        "token": token
+                    })
                     self.send_history()
                     return True
 
@@ -103,6 +272,31 @@ class ClientHandler:
 
             else:
                 self.send_json({"type": "error", "message": "Expected a 'login' or 'register' request."})
+
+    def replace_existing_session(self):
+        """
+        Called once this connection's login is proven valid (password or token).
+        If the same account is already connected, that older connection is told
+        it was replaced and closed, and this one takes over silently — nobody
+        sees "left" or "joined", because from the chat's point of view the user
+        never went away.
+        """
+        with clients_lock:
+            old = next((c for c in clients if c.username == self.username), None)
+            if old is not None:
+                old.replaced = True   # set before closing, so old.disconnect() stays quiet
+                clients.remove(old)
+
+        if old is None:
+            return
+
+        self.took_over_session = True
+        logger.info(f"{self.username}: replacing older session from {old.address}")
+
+        # Queue the notice, then close gracefully so the writer thread gets
+        # (up to CLOSE_FLUSH_SECONDS) to actually send it before the socket closes.
+        old.send_json({"type": "session_replaced", "message": "You were logged in from another place."})
+        old.close(graceful=True)
 
     def send_history(self):
         """
@@ -132,7 +326,7 @@ class ClientHandler:
 
     def listen(self):
         while True:
-            line = self.reader.readline()
+            line = self._read_line()
             if not line:
                 break
             raw = line.strip()
@@ -145,10 +339,25 @@ class ClientHandler:
                 logger.warning(f"Invalid JSON from {self.username}: {raw}")
                 continue
 
+            if not isinstance(data, dict):
+                continue
+
+            # Heartbeat first: otherwise a ping would fall through to the
+            # "everything else is chat" branch below and be broadcast.
+            if self._handle_heartbeat(data):
+                continue
+
             msg_type = data.get("type")
             message = data.get("message", "")
 
-            if msg_type == "dm":
+            if msg_type == "logout":
+                # Like quitting, but also kills the saved token so the next
+                # launch has to ask for the password again.
+                tokens.delete_token(self.username)
+                self.logging_out = True
+                self.send_json({"type": "logout_result", "success": True, "message": "Logged out."})
+                break
+            elif msg_type == "dm":
                 self.handle_dm(data.get("target"), message)
             else:
                 self.handle_broadcast(message)
@@ -187,33 +396,34 @@ class ClientHandler:
         with clients_lock:
             recipients = [c for c in clients if c is not self]
         for client in recipients:
-            try:
-                client.send_json(payload)
-            except Exception:
-                logger.warning(f"Failed to send to {client.username}, dropping them")
+            client.send_json(payload)   # just queues; a stuck client can't hold anyone up
 
     def broadcast_system(self, message):
-        with clients_lock:
-            recipients = [c for c in clients if c is not self]
-        payload = {"type": "system", "message": message}
-        for client in recipients:
-            try:
-                client.send_json(payload)
-            except Exception:
-                logger.warning(f"Failed to send system message to {client.username}")
+        self.broadcast({"type": "system", "message": message})
 
     def run(self):
         logger.info(f"New connection from {self.address}")
 
-        if not self.authenticate():
-            self.client_socket.close()
+        # The watcher runs from the moment of connecting, so a connection that
+        # dies during login is noticed too.
+        threading.Thread(target=self._watch, daemon=True).start()
+
+        try:
+            authenticated = self.authenticate()
+        except Exception:
+            logger.exception(f"Error while authenticating {self.address}")
+            authenticated = False
+
+        if not authenticated:
+            self.close(graceful=False)
             return
 
         with clients_lock:
             clients.append(self)
         logger.info(f"{self.username} authenticated from {self.address}")
 
-        self.broadcast_system(f"{self.username} joined the chat")
+        if not self.took_over_session:
+            self.broadcast_system(f"{self.username} joined the chat")
 
         try:
             self.listen()
@@ -224,16 +434,16 @@ class ClientHandler:
         with clients_lock:
             if self in clients:
                 clients.remove(self)
-        try:
-            self.client_socket.close()
-        except Exception:
-            pass
+        # After a /logout, give "Logged out." a moment to be sent first.
+        # Otherwise (client left, or connection died) there is nobody to flush to.
+        self.close(graceful=self.logging_out)
         logger.info(f"{self.username} disconnected")
-        self.broadcast_system(f"{self.username} left the chat")
+        if not self.replaced:
+            self.broadcast_system(f"{self.username} left the chat")
 
 
 def main():
-    schema.init_db()
+    db.init_db()
     auth.prune_old_attempts()  # housekeeping pass on startup; see note below on real cron scheduling
 
     ssl_context = tls.get_server_context()

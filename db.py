@@ -30,5 +30,12 @@ def init_db():
                 timestamp REAL NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tokens (
+                token_hash TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                expires_at REAL NOT NULL
+            )
+        """)
         conn.commit()
     logger.info("Database initialized")
